@@ -1,0 +1,132 @@
+Cell 1 — Check package versions
+You already have MLflow 3.12.0 and LangGraph installed. Run:
+import mlflowimport langgraphimport langchain_coreprint("MLflow:", mlflow.__version__)print("LangGraph:", getattr(langgraph, "__version__", "Installed"))print("LangChain Core:", langchain_core.__version__)
+
+
+
+Do not downgrade MLflow or LangGraph to the older versions pinned in the historical Databricks example. We will use your installed environment and check compatibility as we proceed.
+Cell 2 — Import the required libraries
+import jsonimport uuidfrom datetime import datetimefrom typing import TypedDict, Anyfrom pyspark.sql import SparkSessionfrom pyspark.sql.types import (    StructType,    StructField,    StringType,    IntegerType,    TimestampType)from langgraph.graph import StateGraph, ENDfrom langchain_core.messages import HumanMessage, AIMessageimport mlflowfrom mlflow.types.llm import (    CHAT_MODEL_INPUT_SCHEMA,    CHAT_MODEL_OUTPUT_SCHEMA)
+
+
+
+Cell 3 — Connect to your existing feedback repository
+Your table is:
+
+workspace.samples.rule_feedback_events
+spark = SparkSession.builder.getOrCreate()table_name = "workspace.samples.rule_feedback_events"print("Feedback table exists:", spark.catalog.tableExists(table_name))
+
+
+
+Expected:
+Feedback table exists: True
+
+
+Cell 4 — Define feedback event capture
+We use the same event structure you created previously.
+feedback_schema = StructType([    StructField("event_id", StringType(), False),    StructField("workflow_type", StringType(), False),    StructField("artifact_id", StringType(), False),    StructField("artifact_version", IntegerType(), False),    StructField("agent_version", StringType(), True),    StructField("decision", StringType(), False),    StructField("original_output", StringType(), True),    StructField("corrected_output", StringType(), True),    StructField("feedback_reason", StringType(), True),    StructField("reviewer_id", StringType(), True),    StructField("event_timestamp", TimestampType(), False)])def save_feedback_event(    artifact_id,    version,    decision,    original_output,    correction,    reason):    event = [(        str(uuid.uuid4()),        "rule_authoring",        artifact_id,        version,        "rule_agent_v1",        decision,        json.dumps(original_output),        json.dumps(correction) if correction is not None else None,        reason,        "SME_001",        datetime.now()    )]    event_df = spark.createDataFrame(event, feedback_schema)    event_df.write.format("delta") \        .mode("append") \        .saveAsTable(table_name)    print("Feedback saved:", decision)
+
+
+
+Cell 5 — Define the rule-authoring graph
+This is the same workflow logic you already tested. We are keeping it simple and deterministic for the prototype.
+class RuleState(TypedDict):    artifact_id: str    rule: dict    version: int    feedback_queue: list    current_feedback: dict    status: strdef generate_rule(state):    rule = {        "rule_name": "Patient Treatment Eligibility",        "condition": "patient_status == active",        "threshold": 90    }    return {        "rule": rule,        "version": 1    }def capture_feedback(state):    feedback = state["feedback_queue"][0]    save_feedback_event(        state["artifact_id"],        state["version"],        feedback["decision"],        state["rule"],        feedback.get("correction"),        feedback["reason"]    )    return {        "current_feedback": feedback,        "feedback_queue": state["feedback_queue"][1:]    }def refine_rule(state):    updated_rule = state["rule"].copy()    correction = state["current_feedback"].get("correction") or {}    updated_rule.update(correction)    return {        "rule": updated_rule,        "version": state["version"] + 1    }def approve_rule(state):    return {"status": "APPROVED"}def reject_rule(state):    return {"status": "REJECTED"}
+
+
+
+Cell 6 — Create the Mosaic-compatible outer LangGraph
+This is the important new part.
+
+The official custom-schema approach expects a chat-compatible interface. We will create an outer LangGraph that:
+1. Receives a user message.
+2. Extracts the rule-authoring request.
+3. Invokes your existing feedback graph.
+4. Returns the result as an assistant message.
+5. Exposes structured rule information separately as custom output.
+class AgentState(TypedDict):    messages: list    custom_outputs: dictdef execute_rule_workflow(state):    last_message = state["messages"][-1]    payload = json.loads(last_message.content)    result = rule_feedback_graph.invoke({        "artifact_id": payload["artifact_id"],        "rule": {},        "version": 0,        "feedback_queue": payload["feedback_queue"],        "current_feedback": {},        "status": "PENDING"    })    final_result = {        "status": result["status"],        "rule": result["rule"],        "version": result["version"]    }    return {        "messages": [            AIMessage(content=json.dumps(final_result))        ],        "custom_outputs": final_result    }agent_builder = StateGraph(AgentState)agent_builder.add_node("rule_workflow", execute_rule_workflow)agent_builder.set_entry_point("rule_workflow")agent_builder.add_edge("rule_workflow", END)agent = agent_builder.compile()print("Mosaic-compatible LangGraph agent created!")
+
+
+
+The outer graph acts as the adapter. Your actual rule-authoring feedback logic remains inside rule_feedback_graph.
+Cell 7 — Test the agent locally
+test_payload = {    "artifact_id": "RULE_101",    "feedback_queue": [        {            "decision": "MODIFY",            "reason": "Threshold should be 180",            "correction": {                "threshold": 180            }        },        {            "decision": "ACCEPT",            "reason": "Updated rule approved",            "correction": None        }    ]}agent_result = agent.invoke({    "messages": [        HumanMessage(content=json.dumps(test_payload))    ],    "custom_outputs": {}})print("Agent response:")print(agent_result["messages"][-1].content)print("\nCustom outputs:")print(agent_result["custom_outputs"])
+
+
+
+Expected result:
+Feedback saved: MODIFY
+Feedback saved: ACCEPT
+
+Agent response:
+{
+  "status": "APPROVED",
+  "rule": {
+    "rule_name": "Patient Treatment Eligibility",
+    "condition": "patient_status == active",
+    "threshold": 180
+  },
+  "version": 2
+}
+
+
+Cell 8 — Verify feedback persistence
+feedback_df = spark.read.table(table_name)display(    feedback_df.filter(        feedback_df.artifact_id == "RULE_101"    ))
+
+
+
+You should see two events: MODIFY and ACCEPT.
+
+Part 3. Apply the official Mosaic AI custom-schema contract
+The official Databricks notebook uses wrap_output to convert LangGraph output into the recommended chat-completion-compatible output format, including custom_outputs. 
+Databricks
+
+
+For your agent, define the following output conversion:
+Cell 9 — Define the output adapter
+def wrap_output(result):    final_message = result["messages"][-1]    return {        "messages": [            {                "role": "assistant",                "content": final_message.content            }        ],        "custom_outputs": result.get("custom_outputs", {})    }wrapped_result = wrap_output(agent_result)print(json.dumps(wrapped_result, indent=2))
+
+
+
+The purpose of this step is to keep the chat response and the structured rule output separate.
+- messages: readable response for the caller.
+- custom_outputs: structured final rule, status and version.
+Important technical distinction: This is the output adaptation step, not yet proof that MLflow can log and serve the model. The official model signature and model-loading test below provide the next validation.
+Part 4. Prepare the agent for MLflow model logging
+The official approach uses a two-notebook, models-as-code workflow. The agent notebook defines the model; the driver notebook logs, registers and deploys it. 
+Databricks
+
+
+For the first compatibility check, we can log the compiled LangGraph object directly through MLflow's LangChain flavor. This avoids pretending that your current notebook's in-memory spark session will automatically exist in a deployed model.
+Cell 10 — Create the model signature
+from mlflow.models.signature import ModelSignatureagent_signature = ModelSignature(    inputs=CHAT_MODEL_INPUT_SCHEMA,    outputs=CHAT_MODEL_OUTPUT_SCHEMA)print("Mosaic AI chat schema loaded!")print(agent_signature)
+
+
+
+Cell 11 — Log the LangGraph model
+with mlflow.start_run():    logged_agent = mlflow.langchain.log_model(        lc_model=agent,        artifact_path="rule_authoring_agent",        signature=agent_signature    )print("Model logged successfully!")print("Model URI:", logged_agent.model_uri)
+
+
+
+This is an important validation step. If the LangChain flavor cannot accept your compiled graph, or the signature does not match, you will see the actual error here.
+
+Note that this is an object-based logging test. The official notebook's full models-as-code implementation uses an agent source notebook and a separate driver notebook. We will use that source-file approach when preparing a deployable artifact.
+Part 5. Register the model in Unity Catalog
+You have:
+- Catalog: workspace
+- Schema: samples
+Use the following code:
+Cell 12 — Register
+mlflow.set_registry_uri("databricks-uc")model_name = "workspace.samples.rule_authoring_agent"registered_model = mlflow.register_model(    model_uri=logged_agent.model_uri,    name=model_name)print("Registered model:", model_name)print("Version:", registered_model.version)
+
+
+
+If this gives a permissions error, it means your current trial identity cannot create registered models in that schema. It does not mean LangGraph is incompatible.
+Part 6. Deployment — optional for your current task
+The official driver notebook uses the Databricks Agents deployment API:
+from databricks import agentsdeployment = agents.deploy(    model_name,    registered_model.version)print(deployment)
+
+
+
+
+Databricks
+I recommend you do not run this cell yet.
